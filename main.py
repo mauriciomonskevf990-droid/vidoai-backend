@@ -126,7 +126,8 @@ def make_scene_prompts(prompt, scene_count, style):
             f"Action: {beat}. "
             f"Visual style: {style}. "
             "Keep characters, clothing and location consistent. "
-            "Natural motion, cinematic composition, no text or logos."
+            "            TEXT_MODEL,
+      Natural motion, cinematic composition, no text or logos."
         )
 
         prompts.append(scene_prompt)
@@ -188,8 +189,7 @@ def generate_scene(scene_prompt, image_url=None):
         )
     else:
         result = fal_client.subscribe(
-            TEXT_MODEL,
-            arguments={
+      arguments={
                 "prompt": scene_prompt,
                 "num_frames": 81,
                 "frames_per_second": 16,
@@ -208,3 +208,135 @@ def generate_scene(scene_prompt, image_url=None):
         )
 
     return url
+
+@app.get("/")
+def root():
+    return {
+        "service": APP_NAME,
+        "status": "ok",
+        "version": "0.2.0",
+        "message": "VidoAI Backend работает"
+    }
+
+
+@app.get("/health")
+def health():
+    return {
+        "ok": True,
+        "fal_key_configured": bool(FAL_KEY)
+    }
+
+
+@app.get("/api/config")
+def api_config():
+    return {
+        "ok": True,
+        "text_to_video": True,
+        "image_to_video": True,
+        "max_duration_minutes": MAX_DURATION_MINUTES,
+        "supported_durations": [3, 5, 10, 15, 30, 45, 60],
+        "voice_and_subtitles": "language selection only; generation not implemented yet"
+    }
+
+
+@app.post("/api/generate")
+async def generate_video(
+    background_tasks: BackgroundTasks,
+    prompt: str = Form(""),
+    duration_minutes: int = Form(3),
+    style: str = Form("cinematic"),
+    voice_language: str = Form("tg"),
+    subtitle_language: str = Form("ru"),
+    photo: Optional[UploadFile] = File(None)
+):
+    prompt = prompt.strip()
+
+    if not FAL_KEY:
+        raise HTTPException(
+            status_code=503,
+            detail="FAL_KEY не настроен в Render Environment."
+        )
+
+    if not prompt and photo is None:
+        raise HTTPException(
+            status_code=400,
+            detail="Введите описание видео или загрузите фотографию."
+        )
+
+    if duration_minutes not in [3, 5, 10, 15, 30, 45, 60]:
+        raise HTTPException(
+            status_code=400,
+            detail="Выберите длительность от 3 до 60 минут из списка."
+        )
+
+    if voice_language not in ALLOWED_LANGUAGES:
+        raise HTTPException(status_code=400, detail="Неизвестный язык озвучки.")
+
+    if subtitle_language not in ALLOWED_LANGUAGES:
+        raise HTTPException(status_code=400, detail="Неизвестный язык субтитров.")
+
+    if photo is not None:
+        content_type = (photo.content_type or "").lower()
+
+        if not content_type.startswith("image/"):
+            raise HTTPException(
+                status_code=415,
+                detail="Загрузите изображение JPG, PNG или WEBP."
+            )
+
+        raw = await photo.read()
+
+        if not raw:
+            raise HTTPException(status_code=400, detail="Фотография пустая.")
+
+        if len(raw) > MAX_UPLOAD_MB * 1024 * 1024:
+            raise HTTPException(
+                status_code=413,
+                detail=f"Фотография должна быть не больше {MAX_UPLOAD_MB} МБ."
+            )
+
+        photo_path = UPLOAD_DIR / f"{uuid.uuid4().hex}.jpg"
+        photo_path.write_bytes(raw)
+    else:
+        photo_path = None
+
+    job_id = uuid.uuid4().hex[:12]
+
+    with JOBS_LOCK:
+        JOBS[job_id] = {
+            "job_id": job_id,
+            "status": "queued",
+            "progress": 0,
+            "message": "Задание принято",
+            "duration_minutes": duration_minutes,
+            "scene_count": duration_minutes * 60 // SCENE_SECONDS,
+            "voice_language": voice_language,
+            "subtitle_language": subtitle_language,
+            "created_at": time.time(),
+            "updated_at": time.time(),
+            "note": "Прототип: озвучка и настоящие субтитры пока не генерируются."
+        }
+
+    return public_job(JOBS[job_id])
+
+
+@app.get("/api/jobs/{job_id}")
+def get_job(job_id: str):
+    with JOBS_LOCK:
+        job = JOBS.get(job_id)
+
+        if job is None:
+            raise HTTPException(status_code=404, detail="Задание не найдено.")
+
+        return public_job(job)
+
+
+@app.get("/api/jobs")
+def list_jobs():
+    with JOBS_LOCK:
+        return {
+            "jobs": [
+                public_job(job)
+                for job in JOBS.values()
+            ]
+        }
