@@ -1,137 +1,211 @@
+
 import os
 import uuid
-import logging
+import time
+import threading
+import subprocess
 from pathlib import Path
 from typing import Optional
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+import fal_client
+import requests
+import imageio_ffmpeg
+
+from fastapi import (
+    FastAPI, UploadFile, File, Form,
+    HTTPException, BackgroundTasks
+)
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from huggingface_hub import InferenceClient
-from dotenv import load_dotenv
 
-load_dotenv()
-logging.basicConfig(level=logging.INFO)
-log = logging.getLogger("vidoai")
 
-BASE_DIR = Path(__file__).resolve().parent
-OUTPUT_DIR = BASE_DIR / "outputs"
-OUTPUT_DIR.mkdir(exist_ok=True)
+APP_NAME = "VidoAI Backend"
 
-HF_TOKEN = os.getenv("HF_TOKEN", "").strip()
-VIDEO_PROVIDER = os.getenv("VIDEO_PROVIDER", "fal-ai").strip()
-TEXT_VIDEO_MODEL = os.getenv("TEXT_VIDEO_MODEL", "Wan-AI/Wan2.2-TI2V-5B").strip()
-IMAGE_VIDEO_MODEL = os.getenv("IMAGE_VIDEO_MODEL", "Wan-AI/Wan2.2-I2V-A14B").strip()
-MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "10"))
-MAX_PROMPT_CHARS = 1500
+ROOT = Path(__file__).resolve().parent
+DATA_DIR = Path(os.getenv("DATA_DIR", str(ROOT / "data")))
+UPLOAD_DIR = DATA_DIR / "uploads"
+OUTPUT_DIR = DATA_DIR / "outputs"
+WORK_DIR = DATA_DIR / "work"
 
-app = FastAPI(title="VidoAI Backend", version="0.1.0")
+for folder in (UPLOAD_DIR, OUTPUT_DIR, WORK_DIR):
+    folder.mkdir(parents=True, exist_ok=True)
 
-# For local testing. In production, set CORS_ORIGINS to your real frontend domain.
-origins = [x.strip() for x in os.getenv("CORS_ORIGINS", "http://127.0.0.1:5500,http://localhost:5500,http://127.0.0.1:8000,http://localhost:8000").split(",") if x.strip()]
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=origins,
-    allow_credentials=False,
-    allow_methods=["GET", "POST"],
-    allow_headers=["*"],
+FAL_KEY = os.getenv("FAL_KEY", "").strip()
+
+TEXT_MODEL = os.getenv(
+    "FAL_TEXT_VIDEO_MODEL",
+    "fal-ai/wan/v2.2-a14b/text-to-video"
 )
 
-app.mount("/outputs", StaticFiles(directory=str(OUTPUT_DIR)), name="outputs")
+IMAGE_MODEL = os.getenv(
+    "FAL_IMAGE_VIDEO_MODEL",
+    "fal-ai/wan/v2.2-a14b/image-to-video"
+)
+
+MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "12"))
+MAX_DURATION_MINUTES = int(os.getenv("MAX_DURATION_MINUTES", "60"))
+MAX_SCENES_PER_JOB = int(os.getenv("MAX_SCENES_PER_JOB", "720"))
+SCENE_SECONDS = max(5, int(os.getenv("SCENE_SECONDS", "5")))
+
+ALLOWED_LANGUAGES = {
+    "auto", "tg", "ru", "en", "fa", "ar",
+    "tr", "es", "fr", "de", "zh", "hi", "other"
+}
+
+app = FastAPI(
+    title=APP_NAME,
+    description="VidoAI video generation backend using fal.ai",
+    version="0.2.0"
+)
+
+origins = [
+    x.strip()
+    for x in os.getenv("CORS_ORIGINS", "*").split(",")
+    if x.strip()
+]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"] if origins == ["*"] else origins,
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"]
+)
+
+app.mount(
+    "/outputs",
+    StaticFiles(directory=str(OUTPUT_DIR)),
+    name="outputs"
+)
+
+# Prototype storage: jobs are lost when the server restarts.
+JOBS = {}
+JOBS_LOCK = threading.Lock()
 
 
-def get_client() -> InferenceClient:
-    if not HF_TOKEN:
-        raise HTTPException(
-            status_code=503,
-            detail="Не настроен HF_TOKEN. Создайте токен Hugging Face с правами Inference Providers и добавьте его в .env."
+def set_job(job_id, **values):
+    with JOBS_LOCK:
+        if job_id in JOBS:
+            JOBS[job_id].update(values)
+            JOBS[job_id]["updated_at"] = time.time()
+
+
+def public_job(job):
+    keys = [
+        "job_id", "status", "progress", "message",
+        "duration_minutes", "scene_count",
+        "voice_language", "subtitle_language",
+        "video_url", "subtitle_url", "error", "note"
+    ]
+    return {key: job[key] for key in keys if key in job}
+
+
+def make_scene_prompts(prompt, scene_count, style):
+    beats = [
+        "Establish the location and atmosphere",
+        "Introduce the main subject clearly",
+        "Show the beginning of the action",
+        "Develop the story with natural movement",
+        "Show a close-up of the main subject",
+        "Reveal more of the environment",
+        "Build tension through cinematic movement",
+        "Show the central action",
+        "Use atmospheric transition shots",
+        "Show the strongest dramatic moment",
+        "Resolve the action",
+        "Finish with a cinematic closing shot"
+    ]
+
+    prompts = []
+
+    for index in range(scene_count):
+        beat = beats[index % len(beats)]
+
+        scene_prompt = (
+            f"{prompt}. "
+            f"Scene {index + 1} of {scene_count}. "
+            f"Action: {beat}. "
+            f"Visual style: {style}. "
+            "Keep characters, clothing and location consistent. "
+            "Natural motion, cinematic composition, no text or logos."
         )
-    return InferenceClient(provider=VIDEO_PROVIDER, api_key=HF_TOKEN, timeout=300)
+
+        prompts.append(scene_prompt)
+
+    return prompts
 
 
-@app.get("/")
-def root():
-    return {
-        "service": "VidoAI Backend",
-        "status": "ok",
-        "message": "API работает. Откройте /docs для проверки эндпоинтов.",
-        "generation_note": "Один запрос создаёт короткий клип, а не готовый фильм на 3–60 минут."
-    }
+def download_file(url, destination):
+    with requests.get(
+        url,
+        stream=True,
+        timeout=(20, 180)
+    ) as response:
+        response.raise_for_status()
+
+        with open(destination, "wb") as output:
+            for chunk in response.iter_content(1024 * 1024):
+                if chunk:
+                    output.write(chunk)
 
 
-@app.get("/health")
-def health():
-    return {"ok": True, "token_configured": bool(HF_TOKEN)}
+def run_ffmpeg(arguments, timeout=1800):
+    ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
+
+    result = subprocess.run(
+        [ffmpeg, "-y", *arguments],
+        capture_output=True,
+        text=True,
+        timeout=timeout
+    )
+
+    if result.returncode != 0:
+        raise RuntimeError(
+            "FFmpeg error: " +
+            (result.stderr[-1500:] if result.stderr else "unknown error")
+        )
+
+    return result
 
 
-@app.post("/api/generate")
-async def generate_video(
-    prompt: str = Form(""),
-    photo: Optional[UploadFile] = File(None),
-    style: str = Form("cinematic"),
-):
-    prompt = prompt.strip()
-    if len(prompt) > MAX_PROMPT_CHARS:
-        raise HTTPException(status_code=413, detail=f"Описание слишком длинное. Максимум {MAX_PROMPT_CHARS} символов.")
-    if not prompt and not photo:
-        raise HTTPException(status_code=400, detail="Введите описание или загрузите фотографию.")
+def generate_scene(scene_prompt, image_url=None):
+    if not FAL_KEY:
+        raise RuntimeError("FAL_KEY is missing in Render Environment.")
 
-    style_map = {
-        "cinematic": "cinematic lighting, smooth camera movement, coherent composition, high detail",
-        "realistic": "photorealistic, natural movement, realistic lighting",
-        "animation": "high quality 3D animation, expressive motion, polished visuals",
-        "documentary": "documentary film look, natural colors, handheld camera realism",
-        "fantasy": "epic fantasy film look, atmospheric light, rich visual details",
-        "advert": "premium commercial film look, polished camera movement, product-quality lighting",
-    }
-    style_hint = style_map.get(style.lower(), style_map["cinematic"])
-    full_prompt = f"{prompt}. Visual style: {style_hint}."
+    os.environ["FAL_KEY"] = FAL_KEY
 
-    try:
-        client = get_client()
-        job_id = uuid.uuid4().hex[:12]
-        output_path = OUTPUT_DIR / f"{job_id}.mp4"
+    if image_url:
+        result = fal_client.subscribe(
+            IMAGE_MODEL,
+            arguments={
+                "image_url": image_url,
+                "prompt": scene_prompt,
+                "num_frames": 81,
+                "frames_per_second": 16,
+                "resolution": "480p",
+                "aspect_ratio": "16:9"
+            },
+            with_logs=False
+        )
+    else:
+        result = fal_client.subscribe(
+            TEXT_MODEL,
+            arguments={
+                "prompt": scene_prompt,
+                "num_frames": 81,
+                "frames_per_second": 16,
+                "resolution": "480p",
+                "aspect_ratio": "16:9"
+            },
+            with_logs=False
+        )
 
-        if photo is not None:
-            content_type = (photo.content_type or "").lower()
-            if not content_type.startswith("image/"):
-                raise HTTPException(status_code=415, detail="Загрузите файл изображения JPG, PNG или WEBP.")
-            raw = await photo.read()
-            if not raw:
-                raise HTTPException(status_code=400, detail="Файл фотографии пуст.")
-            if len(raw) > MAX_UPLOAD_MB * 1024 * 1024:
-                raise HTTPException(status_code=413, detail=f"Фото должно быть меньше {MAX_UPLOAD_MB} МБ.")
-            log.info("Starting image-to-video job %s", job_id)
-            video_bytes = client.image_to_video(
-                raw,
-                model=IMAGE_VIDEO_MODEL,
-                prompt=full_prompt,
-                num_frames=49,
-            )
-        else:
-            log.info("Starting text-to-video job %s", job_id)
-            video_bytes = client.text_to_video(
-                full_prompt,
-                model=TEXT_VIDEO_MODEL,
-                num_frames=49,
-            )
+    video = result.get("video", {}) if isinstance(result, dict) else {}
+    url = video.get("url") if isinstance(video, dict) else None
 
-        if not video_bytes:
-            raise HTTPException(status_code=502, detail="AI-сервис вернул пустой результат.")
-        output_path.write_bytes(video_bytes)
-        return {
-            "ok": True,
-            "job_id": job_id,
-            "video_url": f"/outputs/{job_id}.mp4",
-            "filename": f"{job_id}.mp4",
-            "message": "Короткий клип готов. Длительность зависит от выбранной модели."
-        }
-    except HTTPException:
-        raise
-    except Exception as exc:
-        log.exception("Video generation failed")
-        # Don't leak API keys or provider internals to the browser.
-        raise HTTPException(
-            status_code=502,
-            detail="Генерация не удалась. Проверьте HF_TOKEN, доступность модели и баланс/лимиты провайдера. Подробности смотрите в терминале сервера."
-        ) from exc
+    if not url:
+        raise RuntimeError(
+            "fal.ai returned no video URL. Check model access and API key."
+        )
+
+    return url
